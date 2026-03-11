@@ -4,79 +4,144 @@ import requests
 import time
 import zipfile
 import io
+import sys
 
-# --- CONFIG ---
+# --- CONFIGURATION ---
 REPO = "OmarMustafa-SwiftAct/remote-build-test"
-TOKEN_VAR_NAME = "GH_BUILD_TOKEN"
+TOKEN_VAR = "GH_BUILD_TOKEN"
 USER_ID = os.getlogin()
 SHADOW_BRANCH = f"build/{USER_ID}"
+POLL_INTERVAL = 5  # Seconds between API checks
+TIMEOUT = 600      # 10 minute timeout
 
-def get_valid_token():
-    token = os.getenv(TOKEN_VAR_NAME)
+def run_git(args):
+    """Executes git commands and returns output/success."""
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Git Error: {result.stderr.strip()}")
+        return False, result.stdout
+    return True, result.stdout
+
+def get_token():
+    """Checks for a valid token, prompts and saves if missing or expired."""
+    token = os.getenv(TOKEN_VAR)
     
-    # Check if token exists and is valid
-    if not token or not is_token_valid(token):
-        print(f"{TOKEN_VAR_NAME} is missing, expired, or invalid.")
+    # Validation check
+    headers = {"Authorization": f"token {token}"} if token else {}
+    valid = False
+    if token:
+        resp = requests.get("https://api.github.com/user", headers=headers)
+        valid = resp.status_code == 200
+
+    if not valid:
+        print(f"GitHub Token ({TOKEN_VAR}) is missing, invalid, or expired.")
         token = input("Please enter a valid GitHub Personal Access Token: ").strip()
-        
-        # Save it permanently to Windows User Environment Variables
-        subprocess.run(["setx", TOKEN_VAR_NAME, token], capture_output=True)
-        print(f"Token saved! (You may need to restart your terminal/IDE for this to take effect globally).")
-        
-        # For the current running process, update the env
-        os.environ[TOKEN_VAR_NAME] = token
-        
+        # Save to Windows User environment variables permanently
+        subprocess.run(["setx", TOKEN_VAR, token], capture_output=True)
+        os.environ[TOKEN_VAR] = token
+        print("Token saved. Note: Restart VS Code later to refresh global environment.")
+    
     return token
 
-def is_token_valid(token):
-    """Test if the token can actually talk to the GitHub API"""
-    headers = {"Authorization": f"token {token}"}
-    response = requests.get("https://api.github.com/user", headers=headers)
-    return response.status_code == 200
+def trigger_shadow_push():
+    """Syncs current workspace to a shadow branch without messing up local state."""
+    print(f"Syncing local changes to {SHADOW_BRANCH}...")
+    
+    # 1. Get current branch name to return to it later
+    success, branch_name = run_git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    original_branch = branch_name.strip()
 
-def trigger_and_download():
-    token = get_valid_token()
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    # 2. Create and push the shadow branch
+    # We use -B to reset the branch if it already exists
+    run_git(["git", "checkout", "-B", SHADOW_BRANCH])
+    run_git(["git", "add", "."])
+    run_git(["git", "commit", "-m", "Remote Build Trigger", "--allow-empty"])
+    
+    print(f"Pushing to origin...")
+    success, _ = run_git(["git", "push", "origin", SHADOW_BRANCH, "--force"])
+    
+    # 3. IMMEDIATELY switch back to original branch
+    run_git(["git", "checkout", original_branch])
+    # Clean up local shadow branch (it's now on the server)
+    run_git(["git", "branch", "-D", SHADOW_BRANCH])
 
-    # 1. Trigger via Git Push (No token needed for Push if using SSH/Credential Manager)
-    print(f"Pushing code to {SHADOW_BRANCH}...")
-    subprocess.run(["git", "checkout", "-B", SHADOW_BRANCH], check=True)
-    subprocess.run(["git", "add", "."], check=True)
-    subprocess.run(["git", "commit", "-m", "Remote build", "--allow-empty"], check=True)
-    subprocess.run(["git", "push", "origin", SHADOW_BRANCH, "--force"], check=True)
-    subprocess.run(["git", "checkout", "-"], check=True)
+    if not success:
+        print("Failed to push to GitHub. Check your internet/permissions.")
+        sys.exit(1)
+    
+    print(f"Changes synced. You are back on '{original_branch}'.")
 
-    # 2. Poll GitHub for the Build Result
-    print("Build started! Polling GitHub for completion...")
+def poll_and_download(token):
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    print("Waiting for GitHub to start the build...")
     run_id = None
-    while not run_id:
-        runs = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs", headers=headers).json()
-        for run in runs.get("workflow_runs", []):
+    start_time = time.time()
+
+    # Find the latest run for our shadow branch
+    while not run_id and (time.time() - start_time < 60):
+        resp = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs", headers=headers).json()
+        for run in resp.get("workflow_runs", []):
             if run["head_branch"] == SHADOW_BRANCH and run["status"] != "completed":
                 run_id = run["id"]
+                print(f"Build found! ID: {run_id}. Monitoring...")
                 break
-        time.sleep(5)
+        time.sleep(3)
 
-    while True:
+    if not run_id:
+        print("Could not find the triggered build on GitHub.")
+        return
+
+    # Watch for completion
+    while time.time() - start_time < TIMEOUT:
         run_data = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}", headers=headers).json()
-        if run_data["status"] == "completed":
-            print(f"Build {run_data['conclusion']}!")
-            if run_data["conclusion"] == "success":
+        status = run_data["status"]
+        conclusion = run_data["conclusion"]
+
+        if status == "completed":
+            print(f"Build finished with status: {conclusion}")
+            if conclusion == "success":
                 download_artifact(run_id, headers)
+            else:
+                print("Build failed. Check GitHub Actions logs for details.")
             break
-        time.sleep(5)
+        
+        time.sleep(POLL_INTERVAL)
 
 def download_artifact(run_id, headers):
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts"
-    artifacts = requests.get(url, headers=headers).json()
+    art_resp = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts", headers=headers).json()
     
-    if artifacts["total_count"] > 0:
-        download_url = artifacts["artifacts"][0]["archive_download_url"]
-        print("Downloading HEX result...")
+    if art_resp["total_count"] > 0:
+        # We take the first artifact found
+        artifact = art_resp["artifacts"][0]
+        download_url = artifact["archive_download_url"]
+        
+        print(f"Downloading {artifact['name']}...")
         r = requests.get(download_url, headers=headers)
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            z.extractall("./output")
-            print("Success! Files saved to ./output folder.")
+        
+        if r.status_code == 200:
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                z.extractall("./build_output")
+                print("Success! Result saved to the './build_output' folder.")
+        else:
+            print("Failed to download artifact.")
+    else:
+        print("No artifacts were found for this build.")
 
 if __name__ == "__main__":
-    trigger_and_download()
+    try:
+        # Ensure we are in a git repo
+        if not os.path.exists(".git"):
+            print("Error: You must run this script from the root of a Git repository.")
+            sys.exit(1)
+            
+        current_token = get_token()
+        trigger_shadow_push()
+        poll_and_download(current_token)
+    except KeyboardInterrupt:
+        print("\nBuild monitoring cancelled by user.")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
