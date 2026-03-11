@@ -9,8 +9,9 @@ import sys
 # --- CONFIGURATION ---
 REPO = "OmarMustafa-SwiftAct/remote-build-test"
 TOKEN_VAR = "GH_BUILD_TOKEN"
-USER_ID = os.getlogin()
+USER_ID = os.getlogin().replace(" ", "-")
 SHADOW_BRANCH = f"build/{USER_ID}"
+
 POLL_INTERVAL = 5  # Seconds between API checks
 TIMEOUT = 600      # 10 minute timeout
 
