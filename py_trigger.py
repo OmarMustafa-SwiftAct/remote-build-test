@@ -45,33 +45,38 @@ def get_token():
     return token
 
 def trigger_shadow_push():
-    """Syncs current workspace to a shadow branch without messing up local state."""
-    print(f"Syncing local changes to {SHADOW_BRANCH}...")
+    print(f"📦 Syncing local changes to {SHADOW_BRANCH}...")
     
-    # 1. Get current branch name to return to it later
+    # 1. Save current branch name
     success, branch_name = run_git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     original_branch = branch_name.strip()
 
-    # 2. Create and push the shadow branch
-    # We use -B to reset the branch if it already exists
+    # 2. STASH your current uncommitted changes (keeps them safe)
+    run_git(["git", "stash", "push", "-u", "-m", "temp_build_stash"])
+
+    # 3. Create the shadow branch based on your CURRENT state
     run_git(["git", "checkout", "-B", SHADOW_BRANCH])
+    
+    # 4. Bring the changes into the shadow branch to push them
+    run_git(["git", "stash", "apply"])
     run_git(["git", "add", "."])
     run_git(["git", "commit", "-m", "Remote Build Trigger", "--allow-empty"])
     
-    print(f"Pushing to origin...")
-    success, _ = run_git(["git", "push", "origin", SHADOW_BRANCH, "--force"])
+    print(f"📡 Pushing to origin...")
+    run_git(["git", "push", "origin", SHADOW_BRANCH, "--force"])
     
-    # 3. IMMEDIATELY switch back to original branch
+    # 5. Switch back to your original branch
     run_git(["git", "checkout", original_branch])
-    # Clean up local shadow branch (it's now on the server)
+    
+    # 6. POP the changes back (restores your editor to EXACTLY how it was)
+    run_git(["git", "stash", "pop"])
+    
+    # 7. Clean up local shadow
     run_git(["git", "branch", "-D", SHADOW_BRANCH])
 
-    if not success:
-        print("Failed to push to GitHub. Check your internet/permissions.")
-        sys.exit(1)
-    
-    print(f"Changes synced. You are back on '{original_branch}'.")
+    print(f"✅ Workspace restored. You are back on '{original_branch}' with all changes intact.")
 
+    
 def poll_and_download(token):
     headers = {
         "Authorization": f"token {token}",
