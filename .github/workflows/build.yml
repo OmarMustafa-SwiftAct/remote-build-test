@@ -15,6 +15,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Build and Run Test
+        run: |
+          gcc main.c -o test_app.exe
+          .\test_app.exe
       - name: Simulate Compile
         run: |
           echo "Compiling..."
