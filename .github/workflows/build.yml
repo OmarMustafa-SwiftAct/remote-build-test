@@ -1,0 +1,22 @@
+name: Shadow Build
+on: [workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: [self-hosted, local-tester]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulate Compile
+        run: |
+          echo "Compiling..."
+          echo "DONE: HEX GENERATED" > output.hex
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: output.hex
+      - name: Auto-Cleanup Branch
+        if: always()
+        run: git push origin --delete ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
