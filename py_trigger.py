@@ -1,57 +1,82 @@
-import subprocess, requests, time, os, zipfile, io
+import os
+import subprocess
+import requests
+import time
+import zipfile
+import io
 
 # --- CONFIG ---
-TOKEN = os.getenv("GH_BUILD_TOKEN") 
-if not TOKEN:
-    print("❌ Error: GH_BUILD_TOKEN environment variable not found!")
-    exit()
 REPO = "OmarMustafa-SwiftAct/remote-build-test"
-USER_ID = "Omar" # Change to differentiate teammates
-HEADERS = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github.v3+json"}
+TOKEN_VAR_NAME = "GH_BUILD_TOKEN"
+USER_ID = os.getlogin()
+SHADOW_BRANCH = f"build/{USER_ID}"
 
-def run_git(args):
-    return subprocess.run(args, capture_output=True, text=True)
-
-def trigger_shadow_build():
-    shadow = f"build-shadow/{USER_ID}"
-    print(f"📦 Creating shadow branch: {shadow}")
+def get_valid_token():
+    token = os.getenv(TOKEN_VAR_NAME)
     
-    # 1. Shadow Push (The "Trick")
-    run_git(["git", "checkout", "-b", shadow])
-    run_git(["git", "add", "."])
-    run_git(["git", "commit", "-m", "Remote build trigger"])
-    run_git(["git", "push", "origin", shadow, "--force"])
-    
-    # 2. Trigger API
-    url = f"https://api.github.com/repos/{REPO}/actions/workflows/build.yml/dispatches"
-    requests.post(url, headers=HEADERS, json={"ref": shadow})
-    
-    # 3. Local Cleanup
-    run_git(["git", "checkout", "-"])
-    run_git(["git", "branch", "-D", shadow])
-    print("🚀 Build triggered! Polling for results...")
-    poll_for_artifact()
-
-def poll_for_artifact():
-    while True:
-        # Get latest run
-        url = f"https://api.github.com/repos/{REPO}/actions/runs?per_page=1"
-        run = requests.get(url, headers=HEADERS).json()["workflow_runs"][0]
+    # Check if token exists and is valid
+    if not token or not is_token_valid(token):
+        print(f"{TOKEN_VAR_NAME} is missing, expired, or invalid.")
+        token = input("Please enter a valid GitHub Personal Access Token: ").strip()
         
-        if run["status"] == "completed":
-            print(f"✅ Build {run['conclusion']}!")
-            if run["conclusion"] == "success":
-                download(run["id"])
+        # Save it permanently to Windows User Environment Variables
+        subprocess.run(["setx", TOKEN_VAR_NAME, token], capture_output=True)
+        print(f"Token saved! (You may need to restart your terminal/IDE for this to take effect globally).")
+        
+        # For the current running process, update the env
+        os.environ[TOKEN_VAR_NAME] = token
+        
+    return token
+
+def is_token_valid(token):
+    """Test if the token can actually talk to the GitHub API"""
+    headers = {"Authorization": f"token {token}"}
+    response = requests.get("https://api.github.com/user", headers=headers)
+    return response.status_code == 200
+
+def trigger_and_download():
+    token = get_valid_token()
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+    # 1. Trigger via Git Push (No token needed for Push if using SSH/Credential Manager)
+    print(f"Pushing code to {SHADOW_BRANCH}...")
+    subprocess.run(["git", "checkout", "-B", SHADOW_BRANCH], check=True)
+    subprocess.run(["git", "add", "."], check=True)
+    subprocess.run(["git", "commit", "-m", "Remote build", "--allow-empty"], check=True)
+    subprocess.run(["git", "push", "origin", SHADOW_BRANCH, "--force"], check=True)
+    subprocess.run(["git", "checkout", "-"], check=True)
+
+    # 2. Poll GitHub for the Build Result
+    print("Build started! Polling GitHub for completion...")
+    run_id = None
+    while not run_id:
+        runs = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs", headers=headers).json()
+        for run in runs.get("workflow_runs", []):
+            if run["head_branch"] == SHADOW_BRANCH and run["status"] != "completed":
+                run_id = run["id"]
+                break
+        time.sleep(5)
+
+    while True:
+        run_data = requests.get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}", headers=headers).json()
+        if run_data["status"] == "completed":
+            print(f"Build {run_data['conclusion']}!")
+            if run_data["conclusion"] == "success":
+                download_artifact(run_id, headers)
             break
         time.sleep(5)
 
-def download(run_id):
+def download_artifact(run_id, headers):
     url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts"
-    art = requests.get(url, headers=HEADERS).json()["artifacts"][0]
-    r = requests.get(art["archive_download_url"], headers=HEADERS)
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        z.extractall("./output")
-    print("🎉 Done! Check the /output folder.")
+    artifacts = requests.get(url, headers=headers).json()
+    
+    if artifacts["total_count"] > 0:
+        download_url = artifacts["artifacts"][0]["archive_download_url"]
+        print("Downloading HEX result...")
+        r = requests.get(download_url, headers=headers)
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            z.extractall("./output")
+            print("Success! Files saved to ./output folder.")
 
 if __name__ == "__main__":
-    trigger_shadow_build()
+    trigger_and_download()
